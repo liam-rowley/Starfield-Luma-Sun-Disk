@@ -222,6 +222,15 @@ static const float HDRHighlightsRestorationMaxScale = 10.f;
 // Values below 1 help ultra bright compressed sources (e.g. the sun disk) keep some of the tint
 // of their surrounding glow instead of snapping to pure white at their geometric edge.
 static const float HDRHighlightsDesaturation = 0.75f;
+// OpenDRT counterpart of "HDRHighlightsRestorationMaxScale" (scene-linear values, after the OpenDRT input scaling).
+// The OpenDRT tonescale maps everything beyond its peak input intersection (~167-300 scene-linear depending on the
+// peak brightness) onto exactly the display peak, so ultra bright emissives (e.g. the sun disk) turn into uniform
+// clipped shapes with a hard edge against their dimmer surrounding glow/bloom.
+// We softly compress the input luminance above the shoulder so even infinitely bright scene values land at
+// "OpenDRTInputHighlightsMax" (kept below the tonescale peak input intersection), keeping a continuous gradient.
+// FLT_MAX on the max disables the cap.
+static const float OpenDRTInputHighlightsShoulderStart = 16.f;
+static const float OpenDRTInputHighlightsMax = 128.f;
 
 static const float OklabGamma = 3.f;
 
@@ -1682,7 +1691,7 @@ void ApplyHDRToneMapperScaling(inout CompositeParams params, inout ToneMapperPar
 
 	//TODO: this should be lerping DRT tonemapper parameters based on the vanilla SDR tonemapper parameters, not branch on them (nor multiply the input color).
 	if (PcwHdrComposite.Tmo != 3) { // ACESFitted/Parametric
-		params.outputColor *= 3.5f; 
+		params.outputColor *= 3.5f;
 		tmParams.inputColor *= 3.5f;
 		tmParams.inputLuminance *= 3.5f;
 	}
@@ -1691,6 +1700,21 @@ void ApplyHDRToneMapperScaling(inout CompositeParams params, inout ToneMapperPar
 		params.outputColor *= 2.8f;
 		tmParams.inputColor *= 2.8f;
 		tmParams.inputLuminance *= 2.8f;
+	}
+
+	// Softly cap the input highlights range in HDR (see "OpenDRTInputHighlightsMax"), so ultra bright emissives
+	// (e.g. the sun disk) can't pin flat onto the display peak through the tonescale, and keep a continuous
+	// gradient against their surrounding glow/bloom instead of showing a hard clipped edge.
+	// The clamp above can't help with this as it restores the original (unbounded) luminance onto the clamped color.
+	// We skip this in SDR to retain the vanilla look, where such sources naturally clip to full white (like their glow).
+	if (HdrDllPluginConstants.DisplayMode > 0 && OpenDRTInputHighlightsMax != FLT_MAX)
+	{
+		const float inputY = Luminance(tmParams.inputColor);
+		if (inputY > OpenDRTInputHighlightsShoulderStart)
+		{
+			const float cappedY = luminanceCompress(inputY, OpenDRTInputHighlightsMax, OpenDRTInputHighlightsShoulderStart);
+			tmParams.inputColor *= cappedY / inputY;
+		}
 	}
 }
 
