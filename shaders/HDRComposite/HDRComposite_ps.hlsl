@@ -210,19 +210,22 @@ static const float PostProcessStrength = 1.f;
 // Exposure to the user for more customization.
 static const float HDRHighlightsModulation = 1.f;
 // Caps how bright of a raw (untonemapped) scene value can be restored on highlights in HDR,
-// expressed as a multiplier of the highlights (shoulder start) threshold.
+// expressed as a multiplier of the user peak brightness (defined in the final output space, and converted
+// to the intermediate spaces where needed, so it's independent of the scene tonemapper parameters).
 // Extremely emissive sources (e.g. the sun disk) can be orders of magnitude brighter than their surrounding
 // glow/bloom in the linear scene buffer; restoring them uncapped pins them flat at the peak brightness after
 // the final highlights compression, turning them into hard clipped shapes with a visible edge against their glow
 // (in SDR both were crushed to ~1 by the shoulder so they blended together).
-// Higher values retain more highlights range (and more flattening of ultra bright sources), FLT_MAX disables the cap.
-static const float HDRHighlightsRestorationMaxScale = 10.f;
+// The highlights compression maps the cap exactly onto the peak brightness, so e.g. 2 means restored values
+// spread with a defined gradient up to 2x the peak brightness, with anything brighter clipping to the peak.
+// Higher values retain more highlights separation (and more flattening of ultra bright sources), FLT_MAX disables the cap.
+static const float HDRHighlightsRestorationMaxPeakScale = 2.f;
 // 1 fully desaturates heavily compressed highlights towards white (the previous hardcoded behavior),
 // 0 fully retains the source hue/chroma through the highlights compression.
 // Values below 1 help ultra bright compressed sources (e.g. the sun disk) keep some of the tint
 // of their surrounding glow instead of snapping to pure white at their geometric edge.
 static const float HDRHighlightsDesaturation = 0.75f;
-// OpenDRT counterpart of "HDRHighlightsRestorationMaxScale" (scene-linear values, after the OpenDRT input scaling).
+// OpenDRT counterpart of "HDRHighlightsRestorationMaxPeakScale" (scene-linear values, after the OpenDRT input scaling).
 // The OpenDRT tonescale maps everything beyond its peak input intersection (~167-300 scene-linear depending on the
 // peak brightness) onto exactly the display peak, so ultra bright emissives (e.g. the sun disk) turn into uniform
 // clipped shapes with a hard edge against their dimmer surrounding glow/bloom.
@@ -959,13 +962,12 @@ void PostInverseTonemapByChannel(
 	// Restore any highlight clipped or just crushed by the direct tonemappers (Hable does that).
 	if (isHighlight)
 	{
-		// Cap the restored raw scene value (see "HDRHighlightsRestorationMaxScale") so ultra bright emissives
-		// (e.g. the sun disk) can't sit orders of magnitude above the rest of the highlights,
-		// which would flatten them all onto the peak brightness after the final highlights compression.
-		const float maxRestoredChannel = sPP.minHighlightsColorOut * HDRHighlightsRestorationMaxScale;
+		// Cap the restored raw scene value (see "HDRHighlightsRestorationMaxPeakScale", pre-converted to this space
+		// by the caller) so ultra bright emissives (e.g. the sun disk) can't sit orders of magnitude above the rest
+		// of the highlights, which would flatten them all onto the peak brightness after the final highlights compression.
 		// Use alpha to smooth any gradient disconnects (not a perfect solution).
 		// Note: if necessary we could do the lerp before the highlights begin, on mid tones.
-		InverseTonemappedColorChannel = lerp(sourceHighlightInverseTonemappedColorChannel, min(InputChannel, maxRestoredChannel), highlightAlpha);
+		InverseTonemappedColorChannel = lerp(sourceHighlightInverseTonemappedColorChannel, min(InputChannel, sPP.maxRestoredColorOut), highlightAlpha);
 	}
 }
 
@@ -1899,9 +1901,21 @@ void ApplySDRToneMapperHDRUpgrade(inout CompositeParams params, in ToneMapperPar
 			break;
 	}
 
+	const float maxOutputLuminance = HdrDllPluginConstants.HDRPeakBrightnessNits / WhiteNits_sRGB;
+
+	// The highlights restoration cap ("HDRHighlightsRestorationMaxPeakScale") is defined relative to the peak
+	// brightness in the final output space, but the restoration below runs before the mid gray normalization and
+	// the paper white scaling, so we predict the mid gray scale the code below will apply and convert the cap into
+	// this space. This makes the cap consistent in output nits independently of the scene tonemapper parameters
+	// (e.g. Hable's shoulder can start extremely low, which would otherwise make a shoulder relative cap crush
+	// all of the restored highlights range way below the peak brightness).
+	const float predictedMidGrayOut = (INVERT_TONEMAP_TYPE > 0) ? lerp(midGrayOut, midGrayIn * (minHighlightsColorOut / minHighlightsColorIn), localSDRTonemapHDRStrength) : midGrayOut;
+	const float predictedMidGrayScale = predictedMidGrayOut / midGrayIn;
+
 	PostInverseTonemapByChannelData sPP;
 	sPP.minHighlightsColorIn  = minHighlightsColorIn;
 	sPP.minHighlightsColorOut = minHighlightsColorOut;
+	sPP.maxRestoredColorOut   = (HDRHighlightsRestorationMaxPeakScale == FLT_MAX) ? FLT_MAX : (maxOutputLuminance * HDRHighlightsRestorationMaxPeakScale * predictedMidGrayScale / paperWhite);
 	sPP.needsInverseTonemap   = needsInverseTonemap;
 
 	PostInverseTonemapByChannel(tmParams.inputColor.r, tonemappedColor.r, inverseTonemappedColor.r, sPP);
@@ -1968,23 +1982,23 @@ void ApplySDRToneMapperHDRUpgrade(inout CompositeParams params, in ToneMapperPar
 	params.outputColor *= paperWhite;
 	minHighlightsColorOut *= paperWhite;
 
-	const float maxOutputLuminance = HdrDllPluginConstants.HDRPeakBrightnessNits / WhiteNits_sRGB;
 	// Never compress highlights before the top 2/3 of the image (the actual ratio is based on a user param), even if it means we have two separate mid tones sections,
 	// one from the SDR tonemapped and one pure linear (hopefully the discontinuous curve won't be noticeable on gradients).
 	const float highlightsModulationPow = HdrDllPluginConstants.ToneMapperHighlights >= 0.5f ? linearNormalization(HdrDllPluginConstants.ToneMapperHighlights, 0.5f, 1.f, 1.f / 3.f, 1.f) : linearNormalization(HdrDllPluginConstants.ToneMapperHighlights, 0.0f, 0.5f, 0.f, 1.f / 3.f);
 	float highlightsShoulderStart = max(maxOutputLuminance * highlightsModulationPow, minHighlightsColorOut);
 	highlightsShoulderStart = (INVERT_TONEMAP_TYPE > 0) ? lerp(0.f, highlightsShoulderStart, localSDRTonemapHDRStrength) : 0.f;
 
-	// Match the highlights restoration cap (see "HDRHighlightsRestorationMaxScale" and "PostInverseTonemapByChannel()"):
+	// Match the highlights restoration cap (see "HDRHighlightsRestorationMaxPeakScale" and "PostInverseTonemapByChannel()"):
 	// the brightest restorable value maps exactly onto the peak brightness, so compressed highlights keep a defined
 	// gradient instead of asymptotically flattening onto the peak (which made ultra bright emissives like the sun disk
 	// look like uniform clipped shapes with a hard edge against their dimmer surrounding glow).
+	// The restored colors were divided by the mid gray scale and multiplied by the paper white just like this cap, so they match.
 	// Post process restoration can still push values slightly beyond the cap, the tonemapper clamps that overshoot.
 	// Make sure the input max stays meaningfully beyond the shoulder start and the output peak to keep the compression math valid.
 	float maxInputLuminance = FLT_MAX;
-	if (HDRHighlightsRestorationMaxScale != FLT_MAX)
+	if (HDRHighlightsRestorationMaxPeakScale != FLT_MAX)
 	{
-		maxInputLuminance = max(minHighlightsColorOut * HDRHighlightsRestorationMaxScale, max(highlightsShoulderStart, maxOutputLuminance) * 1.001f);
+		maxInputLuminance = max(maxOutputLuminance * HDRHighlightsRestorationMaxPeakScale, max(highlightsShoulderStart, maxOutputLuminance) * 1.001f);
 	}
 	params.outputColor = DICETonemap(params.outputColor, maxOutputLuminance, highlightsShoulderStart, HDRHighlightsModulation, maxInputLuminance);
 }

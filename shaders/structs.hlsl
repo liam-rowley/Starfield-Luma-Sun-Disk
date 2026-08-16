@@ -193,6 +193,7 @@ struct PostInverseTonemapByChannelData
 {
 	float minHighlightsColorIn;
 	float minHighlightsColorOut;
+	float maxRestoredColorOut;
 	bool  needsInverseTonemap;
 };
 
